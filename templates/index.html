@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Prosodic Matrix & Polyphonic Rhyme Lab</title>
+    <style>
+        body { font-family: 'Segoe UI', monospace, sans-serif; background: #121214; color: #e0e0e0; margin: 0; padding: 20px; }
+        h1, h2, h3 { color: #4db6ac; margin-top: 0; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .card { background: #1e1e24; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.4); }
+        .full-width { grid-column: span 2; }
+        input, button, textarea { background: #2a2a32; border: 1px solid #444; color: #fff; padding: 8px 12px; border-radius: 4px; }
+        button { background: #00897b; font-weight: bold; cursor: pointer; }
+        button:hover { background: #00bfa5; }
+        .button-secondary { background: #37474f; }
+        .button-secondary:hover { background: #455a64; }
+        .button-danger { background: #c62828; }
+        .button-danger:hover { background: #e53935; }
+        
+        /* Interactive Stress Matrix Display */
+        .bit-container { display: flex; flex-wrap: wrap; gap: 4px; margin: 15px 0; font-family: monospace; }
+        .bit-box { 
+            width: 32px; height: 42px; display: flex; flex-direction: column; align-items: center; 
+            justify-content: center; background: #2a2a32; border: 1px solid #444; border-radius: 4px; 
+            cursor: pointer; user-select: none; 
+        }
+        .bit-box.selected { border-color: #ffd54f; background: #3d3b2a; }
+        .bit-box.stressed { color: #00e676; font-weight: bold; }
+        .bit-box.unstressed { color: #888; }
+        .bit-idx { font-size: 9px; color: #666; margin-top: 2px; }
+
+        .line-input { width: 100%; height: 60px; font-family: inherit; margin-bottom: 10px; }
+        .word-chip { display: inline-block; background: #33333d; border-left: 3px solid #00bfa5; padding: 6px 10px; margin: 3px; border-radius: 3px; font-size: 13px; cursor: pointer; transition: background 0.2s; }
+        .word-chip:hover { background: #004d40; color: #fff; }
+        .poly-item { padding: 6px; background: #2a2a32; margin-bottom: 4px; cursor: pointer; border-radius: 4px; }
+        .poly-item:hover { background: #383842; }
+
+        /* Multi-Line Stanza Builder UI */
+        .stanza-container { display: flex; flex-direction: column; gap: 12px; margin-top: 15px; }
+        .line-row { display: flex; align-items: center; gap: 10px; background: #18181c; padding: 10px; border-radius: 6px; border: 1px solid #333; }
+        .line-row.active-line { border-color: #00bfa5; background: #1f2826; }
+        .line-number { font-weight: bold; color: #4db6ac; width: 60px; }
+        .line-content { flex-grow: 1; font-family: monospace; font-size: 15px; color: #fff; background: #22222a; padding: 8px; border-radius: 4px; min-height: 20px; }
+        .line-controls { display: flex; gap: 6px; }
+    </style>
+</head>
+<body>
+
+    <h1>Prosodic Matrix & Rhythm Builder</h1>
+
+    <div class="grid">
+        <!-- POLYGON STRESS PATTERN GENERATOR -->
+        <div class="card">
+            <h2>1. Polygon Stress Generator</h2>
+            <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
+                <label>N-gon Syllables:</label>
+                <input type="number" id="n-input" value="7" min="3" max="16" style="width: 50px;">
+                <button onclick="fetchPolygons()">Find Polygons</button>
+            </div>
+            <div id="polygon-list" style="max-height: 150px; overflow-y: auto;"></div>
+            
+            <div style="margin-top: 15px;">
+                <label>Repeat Count for Verse:</label>
+                <input type="number" id="repeat-input" value="2" min="1" max="8" style="width: 50px;">
+                <button onclick="applyPolygonVerse()">Construct Verse Pattern</button>
+            </div>
+        </div>
+
+        <!-- PHRASE BREAKDOWN AND ANALYSIS -->
+        <div class="card">
+            <h2>2. Analyze Existing Phrase</h2>
+            <textarea id="phrase-input" class="line-input" placeholder="Type a phrase to break down into phonics and stress patterns..."></textarea>
+            <button onclick="analyzePhrase()">Deconstruct Phrase</button>
+            <div id="phrase-tokens" style="margin-top: 10px;"></div>
+        </div>
+
+        <!-- INTERACTIVE VERSE PROSODIC MATRIX -->
+        <div class="card full-width">
+            <h2>3. Prosodic Matrix Selection</h2>
+            <p style="font-size: 12px; color: #aaa;">Click individual syllables to build custom metric foot selections, then click any matching word to append it to your active line.</p>
+            
+            <div id="matrix-container" class="bit-container"></div>
+            
+            <div style="display: flex; gap: 15px; align-items: center; background: #18181c; padding: 10px; border-radius: 6px;">
+                <div>Selected Stress Pattern: <strong id="selected-pattern-display" style="color: #ffd54f;">None</strong></div>
+                <div>Metrical Foot: <span id="foot-display" style="color: #00bfa5;">-</span></div>
+                <div>Tail Rhyme Index: <span id="tail-idx-display">0</span></div>
+                <button onclick="cycleTail(1)">Next Rhyme Tail ➔</button>
+            </div>
+
+            <h3 style="margin-top: 20px;">Matching Word Recommendations (Click to Insert)</h3>
+            <div id="word-list-container">
+                <p style="color: #666;">Select syllables above to load vocabulary options matching the prosodic structure.</p>
+            </div>
+        </div>
+
+        <!-- MULTI-LINE STANZA BUILDER -->
+        <div class="card full-width">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>4. Multi-Line Composition Builder</h2>
+                <button onclick="addNewLine()">+ Add New Line</button>
+            </div>
+            <p style="font-size: 12px; color: #aaa;">Target any line by clicking "Target", then click recommended words above to build your verse. Lines can be moved or edited arbitrarily.</p>
+            
+            <div id="stanza-container" class="stanza-container"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentVersePattern = "1001001010010010";
+        let selectedIndices = [];
+        let currentTailIndex = 0;
+        let selectedPolygonPattern = "";
+
+        // Multi-line Stanza Builder State
+        let stanzaLines = [""];
+        let activeLineIndex = 0;
+
+        async function fetchPolygons() {
+            const n = document.getElementById('n-input').value;
+            const res = await fetch(`/api/polygons?n=${n}`);
+            const data = await res.json();
+            const list = document.getElementById('polygon-list');
+            list.innerHTML = '';
+            
+            data.polygons.forEach(p => {
+                const el = document.createElement('div');
+                el.className = 'poly-item';
+                el.innerHTML = `<strong>[${p.pattern_str}]</strong> <span style="font-size: 11px; color: #888;">${p.type}</span>`;
+                el.onclick = () => { selectedPolygonPattern = p.pattern_str; alert('Selected pattern: ' + p.pattern_str); };
+                list.appendChild(el);
+            });
+            if(data.polygons.length > 0) selectedPolygonPattern = data.polygons[0].pattern_str;
+        }
+
+        function applyPolygonVerse() {
+            if(!selectedPolygonPattern) return;
+            const reps = parseInt(document.getElementById('repeat-input').value);
+            currentVersePattern = selectedPolygonPattern.repeat(reps);
+            selectedIndices = [];
+            renderMatrix();
+        }
+
+        function renderMatrix() {
+            const container = document.getElementById('matrix-container');
+            container.innerHTML = '';
+            
+            currentVersePattern.split('').forEach((bit, idx) => {
+                const box = document.createElement('div');
+                box.className = `bit-box ${bit === '1' ? 'stressed' : 'unstressed'} ${selectedIndices.includes(idx) ? 'selected' : ''}`;
+                box.innerHTML = `<div>${bit}</div><div class="bit-idx">${idx}</div>`;
+                box.onclick = () => toggleSelectBit(idx);
+                container.appendChild(box);
+            });
+            updateSelectionAnalysis();
+        }
+
+        function toggleSelectBit(idx) {
+            if (selectedIndices.includes(idx)) {
+                selectedIndices = selectedIndices.filter(i => i !== idx);
+            } else {
+                selectedIndices.push(idx);
+            }
+            selectedIndices.sort((a, b) => a - b);
+            currentTailIndex = 0;
+            renderMatrix();
+        }
+
+        function updateSelectionAnalysis() {
+            if(selectedIndices.length === 0) {
+                document.getElementById('selected-pattern-display').innerText = "None";
+                document.getElementById('foot-display').innerText = "-";
+                document.getElementById('word-list-container').innerHTML = '<p style="color: #666;">Select syllables above.</p>';
+                return;
+            }
+
+            const patternStr = selectedIndices.map(i => currentVersePattern[i]).join('');
+            document.getElementById('selected-pattern-display').innerText = patternStr;
+            fetchWordRecommendations(patternStr);
+        }
+
+        async function fetchWordRecommendations(patternStr) {
+            const res = await fetch('/api/lookup_words', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ stress_pattern: patternStr, tail_index: currentTailIndex })
+            });
+            const data = await res.json();
+            
+            document.getElementById('foot-display').innerText = data.metrical_foot || "Unknown";
+            document.getElementById('tail-idx-display').innerText = `${data.current_tail_index + 1} / ${data.tails_count || 0} (${data.current_tail || 'None'})`;
+
+            const container = document.getElementById('word-list-container');
+            if(!data.words || data.words.length === 0) {
+                container.innerHTML = '<p style="color: #888;">No exact rhyme/stress matches found. Try incrementing rhyme tail or altering selection.</p>';
+                return;
+            }
+
+            container.innerHTML = '';
+            data.words.forEach(w => {
+                const chip = document.createElement('div');
+                chip.className = 'word-chip';
+                chip.innerText = w;
+                chip.onclick = () => appendWordToActiveLine(w);
+                container.appendChild(chip);
+            });
+        }
+
+        function cycleTail(step) {
+            currentTailIndex += step;
+            const patternStr = selectedIndices.map(i => currentVersePattern[i]).join('');
+            if(patternStr) fetchWordRecommendations(patternStr);
+        }
+
+        async function analyzePhrase() {
+            const phrase = document.getElementById('phrase-input').value;
+            const res = await fetch('/api/analyze_phrase', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ phrase: phrase })
+            });
+            const data = await res.json();
+            
+            const container = document.getElementById('phrase-tokens');
+            container.innerHTML = '<strong>Phonetic Breakdown:</strong><br>';
+            data.tokens.forEach(t => {
+                const chip = document.createElement('div');
+                chip.className = 'word-chip';
+                chip.innerHTML = `${t.word} <i>[${t.stress}]</i> <small>(${t.foot})</small>`;
+                chip.onclick = () => appendWordToActiveLine(t.word);
+                container.appendChild(chip);
+            });
+
+            if(data.full_stress_pattern) {
+                currentVersePattern = data.full_stress_pattern;
+                selectedIndices = [];
+                renderMatrix();
+            }
+        }
+
+        /* Multi-Line Stanza Builder Logic */
+        function renderStanzaBuilder() {
+            const container = document.getElementById('stanza-container');
+            container.innerHTML = '';
+
+            stanzaLines.forEach((lineText, idx) => {
+                const row = document.createElement('div');
+                row.className = `line-row ${idx === activeLineIndex ? 'active-line' : ''}`;
+                
+                row.innerHTML = `
+                    <div class="line-number">Line ${idx + 1}</div>
+                    <div class="line-content" contenteditable="true" oninput="updateLineText(${idx}, this.innerText)">${lineText}</div>
+                    <div class="line-controls">
+                        <button class="${idx === activeLineIndex ? '' : 'button-secondary'}" onclick="setActiveLine(${idx})">
+                            ${idx === activeLineIndex ? 'Targeted' : 'Target'}
+                        </button>
+                        <button class="button-secondary" onclick="moveLine(${idx}, -1)">▲</button>
+                        <button class="button-secondary" onclick="moveLine(${idx}, 1)">▼</button>
+                        <button class="button-danger" onclick="deleteLine(${idx})">✕</button>
+                    </div>
+                `;
+                container.appendChild(row);
+            });
+        }
+
+        function appendWordToActiveLine(word) {
+            if (stanzaLines.length === 0) {
+                stanzaLines.push('');
+                activeLineIndex = 0;
+            }
+            const current = stanzaLines[activeLineIndex].trim();
+            stanzaLines[activeLineIndex] = current ? `${current} ${word}` : word;
+            renderStanzaBuilder();
+        }
+
+        function setActiveLine(idx) {
+            activeLineIndex = idx;
+            renderStanzaBuilder();
+        }
+
+        function updateLineText(idx, text) {
+            stanzaLines[idx] = text;
+        }
+
+        function addNewLine() {
+            stanzaLines.push("");
+            activeLineIndex = stanzaLines.length - 1;
+            renderStanzaBuilder();
+        }
+
+        function deleteLine(idx) {
+            stanzaLines.splice(idx, 1);
+            if (stanzaLines.length === 0) {
+                stanzaLines = [""];
+                activeLineIndex = 0;
+            } else if (activeLineIndex >= stanzaLines.length) {
+                activeLineIndex = stanzaLines.length - 1;
+            }
+            renderStanzaBuilder();
+        }
+
+        function moveLine(idx, direction) {
+            const targetIdx = idx + direction;
+            if (targetIdx < 0 || targetIdx >= stanzaLines.length) return;
+            const temp = stanzaLines[idx];
+            stanzaLines[idx] = stanzaLines[targetIdx];
+            stanzaLines[targetIdx] = temp;
+            
+            if (activeLineIndex === idx) {
+                activeLineIndex = targetIdx;
+            } else if (activeLineIndex === targetIdx) {
+                activeLineIndex = idx;
+            }
+            renderStanzaBuilder();
+        }
+
+        // Initialize default view
+        fetchPolygons();
+        renderMatrix();
+        renderStanzaBuilder();
+    </script>
+</body>
+</html>
