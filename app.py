@@ -5,16 +5,20 @@ import os
 import re
 from collections import defaultdict, Counter
 import nltk
+from nltk.corpus import cmudict, wordnet
 import pronouncing
 from flask import Flask, jsonify, render_template_string, request
 
+# Ensure NLTK datasets are present
 nltk.download("wordnet", quiet=True)
 nltk.download("words", quiet=True)
+nltk.download("averaged_perceptron_tagger", quiet=True)
+nltk.download("cmudict", quiet=True)
 
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. METRICAL FEET DICTIONARY
+# 1. METRICAL FEET DICTIONARY & STRESS MAPPER
 # ==============================================================================
 METRICAL_FEET = {
     "01": "Iamb", "10": "Trochee", "11": "Spondee", "00": "Pyrrhic",
@@ -26,12 +30,28 @@ METRICAL_FEET = {
 }
 
 def identify_metrical_foot(stress_pattern):
-    normalized = "".join(["1" if c == "1" else "0" for c in stress_pattern])
+    normalized = "".join(["1" if c in ("1", "2") else "0" for c in stress_pattern])
     return METRICAL_FEET.get(normalized, "Custom Foot")
+
+def edit_distance(s1, s2):
+    if len(s1) < len(s2):
+        return edit_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    return previous_row[-1]
 
 
 # ==============================================================================
-# 2. PHONETIC & RHYME ENGINE
+# 2. PHONETIC, POS & LEVENSHTEIN RHYME ENGINE
 # ==============================================================================
 class UnifiedPhonicsEngine:
     def __init__(self, max_word_length=20):
@@ -41,7 +61,9 @@ class UnifiedPhonicsEngine:
             "EY", "IH", "IY", "OW", "OY", "UH", "UW"
         }
         self.word_profiles = {}
+        # Matrix structured by raw stress strings (preserving '1', '2', '0')
         self.rhyme_matrix = defaultdict(lambda: defaultdict(list))
+        self.cmu = cmudict.dict() if cmudict else {}
         self._build_indices()
 
     def _clean_word(self, word):
@@ -55,7 +77,7 @@ class UnifiedPhonicsEngine:
         for i, t in enumerate(tokens):
             clean_p = "".join([c for c in t if not c.isdigit()])
             if clean_p in self.vowel_phonemes:
-                if "1" in t or stressed_idx == -1:
+                if "1" in t or "2" in t or stressed_idx == -1:
                     stressed_idx = i
                     if "1" in t:
                         break
@@ -65,11 +87,9 @@ class UnifiedPhonicsEngine:
 
         rhyme_tokens = ["".join([c for c in t if not c.isdigit()]) for t in tokens[stressed_idx:]]
         rhyme_tail = "_".join(rhyme_tokens)
-        binary_stress = "".join(["1" if char == "1" else "0" for char in stresses])
 
         return {
-            "stress": binary_stress,
-            "raw_stress": stresses,
+            "stress": stresses,
             "syllables": len(stresses),
             "rhyme_tail": rhyme_tail,
         }
@@ -96,8 +116,11 @@ class UnifiedPhonicsEngine:
         words = re.findall(r"\b[a-zA-Z]+\b", text.lower())
         results = []
         full_stress = ""
+        
+        # POS Tagging
+        tokens_tagged = nltk.pos_tag(words)
 
-        for w in words:
+        for w, pos in tokens_tagged:
             prof = self.word_profiles.get(w)
             if not prof:
                 phones = pronouncing.phones_for_word(w)
@@ -110,64 +133,82 @@ class UnifiedPhonicsEngine:
                     "stress": prof["stress"],
                     "syllables": prof["syllables"],
                     "rhyme_tail": prof["rhyme_tail"],
+                    "pos": pos,
                     "foot": identify_metrical_foot(prof["stress"]),
                 })
                 full_stress += prof["stress"]
             else:
                 results.append({
                     "word": w,
-                    "stress": "?",
+                    "stress": "1",
                     "syllables": 1,
                     "rhyme_tail": "unknown",
+                    "pos": pos,
                     "foot": "Unknown",
                 })
+                full_stress += "1"
 
         return {"tokens": results, "full_stress_pattern": full_stress}
 
-    def get_words_for_selection(self, stress_pattern, line_context_words=None, tail_index=0):
-        if stress_pattern not in self.rhyme_matrix:
+    def get_words_for_selection(self, stress_pattern, line_context_words=None, tail_index=0, target_pos=None):
+        # Match pattern flexibly across 1s, 2s, and 0s
+        matching_keys = [k for k in self.rhyme_matrix.keys() if len(k) == len(stress_pattern) and 
+                         all(p == '0' and k_i == '0' or p != '0' and k_i != '0' for p, k_i in zip(stress_pattern, k))]
+        
+        if not matching_keys:
             return {"tails": [], "current_tail": None, "words": []}
 
-        available_tails = list(self.rhyme_matrix[stress_pattern].keys())
-        if not available_tails:
+        all_tails = set()
+        for k in matching_keys:
+            all_tails.update(self.rhyme_matrix[k].keys())
+
+        if not all_tails:
             return {"tails": [], "current_tail": None, "words": []}
 
         # Priority 1: Extract rhyme tails from existing line/stanza words
-        prioritized_tails = []
+        context_tails = []
         if line_context_words:
-            pref_tails = []
             for pw in line_context_words:
                 clean_pw = self._clean_word(pw)
                 prof = self.word_profiles.get(clean_pw)
-                if prof and prof["rhyme_tail"] in available_tails:
-                    pref_tails.append(prof["rhyme_tail"])
+                if prof and prof["rhyme_tail"] in all_tails:
+                    context_tails.append(prof["rhyme_tail"])
+
+        target_tail = context_tails[0] if context_tails else list(all_tails)[0]
+
+        # Levenshtein distance ordering on Rhyme Tails
+        sorted_tails = sorted(list(all_tails), key=lambda t: edit_distance(t, target_tail))
+
+        selected_tail = sorted_tails[tail_index % len(sorted_tails)]
+
+        word_list = []
+        for k in matching_keys:
+            word_list.extend(self.rhyme_matrix[k][selected_tail])
             
-            tail_counts = Counter(pref_tails)
-            prioritized_tails = [t for t, _ in tail_counts.most_common()]
+        word_list = sorted(list(set(word_list)))
 
-        for t in sorted(available_tails):
-            if t not in prioritized_tails:
-                prioritized_tails.append(t)
-
-        selected_tail = prioritized_tails[tail_index % len(prioritized_tails)]
-        word_list = self.rhyme_matrix[stress_pattern][selected_tail]
+        # Part of Speech filtering if requested
+        if target_pos:
+            pos_words = [w for w, tag in nltk.pos_tag(word_list) if tag.startswith(target_pos)]
+            if pos_words:
+                word_list = pos_words
 
         return {
-            "tails_count": len(prioritized_tails),
-            "current_tail_index": tail_index % len(prioritized_tails),
+            "tails_count": len(sorted_tails),
+            "current_tail_index": tail_index % len(sorted_tails),
             "current_tail": selected_tail,
             "metrical_foot": identify_metrical_foot(stress_pattern),
-            "words": sorted(list(set(word_list))),
-            "is_prioritized": len(prioritized_tails) > 0 and selected_tail in prioritized_tails[:len(line_context_words or [])]
+            "words": word_list,
+            "is_prioritized": len(context_tails) > 0 and selected_tail in context_tails
         }
 
 
 phonics_engine = UnifiedPhonicsEngine()
 
 # ==============================================================================
-# 3. POLYGON & RHYTHM ENGINE
+# 3. PROPERLY BALANCED POLYGON & RHYTHM ENGINE (ZERO-CENTROID ORIGIN)
 # ==============================================================================
-def bjorklund_euclidean(steps: int, pulses: int) -> list[int]:
+def bjorklund(steps: int, pulses: int) -> list[int]:
     if pulses <= 0: return [0] * steps
     if pulses >= steps: return [1] * steps
     pattern = [[1] for _ in range(pulses)]
@@ -189,27 +230,47 @@ def get_centroid(pattern: list[int], N: int) -> tuple[float, float]:
     center = total_vector / sum(pattern)
     return center.real, center.imag
 
-def analyze_polygon(pattern: list[int], N: int, tol: float = 1e-5) -> dict:
+def is_strictly_balanced(pattern: list[int], N: int, tol: float = 1e-5) -> bool:
     cx, cy = get_centroid(pattern, N)
-    dist = math.hypot(cx, cy)
-    is_c1 = dist < tol
-    dft_zeros = sum(1 for k in range(1, N) if abs(sum(cmath.exp(-2j * math.pi * k * i / N) for i, b in enumerate(pattern) if b)) < tol)
-    is_c2 = (dft_zeros > 0) and not is_c1
+    return math.hypot(cx, cy) < tol
+
+def analyze_polygon(pattern: list[int], N: int) -> dict:
+    cx, cy = get_centroid(pattern, N)
+    balanced = is_strictly_balanced(pattern, N)
     return {
         "pattern_str": "".join(map(str, pattern)),
-        "is_interesting": is_c1 or is_c2 or (sum(pattern) > 1 and N % sum(pattern) != 0),
-        "type": "Cyclotomic" if (is_c1 or is_c2) else "Euclidean"
+        "is_balanced": balanced,
+        "centroid": [round(cx, 5), round(cy, 5)],
+        "dist_from_origin": round(math.hypot(cx, cy), 5),
+        "type": "Balanced (Cyclotomic)" if balanced else "Unbalanced (Euclidean)"
     }
+
+def get_canonical_rotation(pattern: list[int]) -> tuple[int, ...]:
+    n = len(pattern)
+    rotations = [tuple(pattern[i:] + pattern[:i]) for i in range(n)]
+    return min(rotations)
 
 def get_interesting_polygons(N: int) -> list[dict]:
     results, seen = [], set()
     for k in range(1, N):
-        euc_pat = bjorklund_euclidean(N, k)
-        key = tuple(euc_pat)
-        if key not in seen:
-            analysis = analyze_polygon(euc_pat, N)
-            seen.add(key)
+        euc_pat = bjorklund(N, k)
+        canonical = get_canonical_rotation(euc_pat)
+        if canonical not in seen:
+            seen.add(canonical)
+            analysis = analyze_polygon(list(canonical), N)
+            analysis["label"] = f"Euclidean E({k},{N})"
             results.append(analysis)
+
+    total_combos = 1 << N
+    for i in range(1, total_combos - 1):
+        pat = [(i >> j) & 1 for j in range(N)]
+        if is_strictly_balanced(pat, N):
+            canonical = get_canonical_rotation(pat)
+            if canonical not in seen:
+                seen.add(canonical)
+                analysis = analyze_polygon(list(canonical), N)
+                analysis["label"] = f"Cyclotomic Balanced ({sum(canonical)} pulses)"
+                results.append(analysis)
     return results
 
 # ==============================================================================
@@ -235,7 +296,8 @@ def api_lookup_words():
     return jsonify(phonics_engine.get_words_for_selection(
         stress_pattern=data.get("stress_pattern", ""),
         line_context_words=data.get("context_words", []),
-        tail_index=int(data.get("tail_index", 0))
+        tail_index=int(data.get("tail_index", 0)),
+        target_pos=data.get("pos_filter")
     ))
 
 # ==============================================================================
@@ -253,7 +315,7 @@ HTML_TEMPLATE = """
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
         .card { background: #1e1e24; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.4); }
         .full-width { grid-column: span 2; }
-        input, button, textarea { background: #2a2a32; border: 1px solid #444; color: #fff; padding: 8px 12px; border-radius: 4px; }
+        input, button, textarea, select { background: #2a2a32; border: 1px solid #444; color: #fff; padding: 8px 12px; border-radius: 4px; }
         button { background: #00897b; font-weight: bold; cursor: pointer; }
         button:hover { background: #00bfa5; }
         .button-secondary { background: #37474f; }
@@ -261,19 +323,18 @@ HTML_TEMPLATE = """
         .button-danger { background: #c62828; }
         .button-danger:hover { background: #e53935; }
 
-        /* Element 3: Matrix Syllable Bar */
         .matrix-bar-container { display: flex; gap: 4px; margin: 15px 0; overflow-x: auto; padding: 10px; background: #18181c; border-radius: 6px; }
         .syllables-box { 
-            flex: 1; min-width: 36px; height: 50px; display: flex; flex-direction: column; align-items: center; 
+            flex: 1; min-width: 42px; height: 55px; display: flex; flex-direction: column; align-items: center; 
             justify-content: center; background: #2a2a32; border: 1px solid #444; border-radius: 4px; 
             cursor: pointer; user-select: none; transition: all 0.2s;
         }
         .syllables-box.selected { border-color: #ffd54f; background: #3d3b2a; }
-        .syllables-box.stressed { color: #00e676; font-weight: bold; }
-        .syllables-box.unstressed { color: #666; }
+        .syllables-box.stress-1 { color: #00e676; font-weight: bold; }
+        .syllables-box.stress-2 { color: #ffb74d; font-weight: bold; }
+        .syllables-box.stress-0 { color: #666; }
         .syllables-idx { font-size: 10px; color: #888; margin-top: 2px; }
 
-        /* Element 4: Stanza Line Builder */
         .stanza-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }
         .line-row { display: flex; align-items: center; gap: 10px; background: #18181c; padding: 10px; border-radius: 6px; border: 1px solid #333; }
         .line-row.active-line { border-color: #00bfa5; background: #1f2826; }
@@ -287,7 +348,7 @@ HTML_TEMPLATE = """
         .word-chip { display: inline-block; background: #33333d; border-left: 3px solid #00bfa5; padding: 6px 10px; margin: 3px; border-radius: 3px; font-size: 13px; cursor: pointer; }
         .word-chip:hover { background: #004d40; color: #fff; }
         .word-chip.prioritized { border-left-color: #ffd54f; background: #3d3b2a; }
-        .poly-item { padding: 6px; background: #2a2a32; margin-bottom: 4px; cursor: pointer; border-radius: 4px; }
+        .poly-item { padding: 8px; background: #2a2a32; margin-bottom: 4px; cursor: pointer; border-radius: 4px; display: flex; justify-content: space-between; }
         .poly-item:hover { background: #383842; }
     </style>
 </head>
@@ -296,57 +357,73 @@ HTML_TEMPLATE = """
     <h1>Prosodic Matrix & Multi-Line Stanza Builder</h1>
 
     <div class="grid">
-        <!-- 1. POLYGON STRESS GENERATOR -->
+        <!-- 1. DECONSTRUCT PHRASE (WORKFLOW STEP 1) -->
         <div class="card">
-            <h2>1. Rhythm & Polygon Generator</h2>
+            <h2>1. Deconstruct Target Phrase</h2>
+            <textarea id="phrase-input" style="width: 100%; height: 50px;" placeholder="Type phrase to extract metrical stress..."></textarea>
+            <button onclick="analyzePhrase()" style="margin-top: 8px;">Deconstruct to Master Pattern</button>
+            <div id="phrase-tokens" style="margin-top: 8px;"></div>
+        </div>
+
+        <!-- 2. RHYTHM & POLYGON OVERLAY (WORKFLOW STEP 2) -->
+        <div class="card">
+            <h2>2. Balanced Rhythm Overlay</h2>
             <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
                 <label>N-gon Syllables:</label>
                 <input type="number" id="n-input" value="8" min="3" max="16" style="width: 50px;">
-                <button onclick="fetchPolygons()">Find Rhythms</button>
+                <button onclick="fetchPolygons()">Find Polygons</button>
             </div>
             <div id="polygon-list" style="max-height: 120px; overflow-y: auto;"></div>
             <div style="margin-top: 10px;">
                 <label>Repeat:</label>
                 <input type="number" id="repeat-input" value="2" min="1" max="4" style="width: 50px;">
-                <button onclick="applyPolygonVerse()">Apply Master Rhythm</button>
+                <button onclick="applyPolygonVerse()">Overlay Master Rhythm</button>
             </div>
         </div>
 
-        <!-- 2. PHRASE DECONSTRUCTION -->
-        <div class="card">
-            <h2>2. Deconstruct Phrase</h2>
-            <textarea id="phrase-input" style="width: 100%; height: 50px;" placeholder="Type phrase to extract metrical stress..."></textarea>
-            <button onclick="analyzePhrase()" style="margin-top: 8px;">Load Matrix Pattern</button>
-            <div id="phrase-tokens" style="margin-top: 8px;"></div>
-        </div>
-
-        <!-- 3. ELEMENT 3: MASTER PROSODIC MATRIX HEADER -->
+        <!-- 3. MASTER PROSODIC MATRIX HEADER -->
         <div class="card full-width">
-            <h2>3. Master Prosodic Matrix</h2>
-            <p style="font-size: 12px; color: #aaa;">Click individual or contiguous syllable blocks below to select stress windows for word lookup.</p>
+            <h2>3. Master Prosodic Matrix & Word Selector</h2>
+            <p style="font-size: 12px; color: #aaa;">
+                Click box to toggle stress (0=Unstressed, 1=Primary, 2=Secondary). Double-click or shift span. 
+                Use cycle buttons to walk word groupings or match parts-of-speech.
+            </p>
             
             <div id="matrix-container" class="matrix-bar-container"></div>
             
-            <div style="display: flex; gap: 15px; align-items: center; background: #18181c; padding: 10px; border-radius: 6px;">
+            <div style="display: flex; gap: 15px; align-items: center; background: #18181c; padding: 10px; border-radius: 6px; flex-wrap: wrap;">
                 <div>Pattern: <strong id="selected-pattern-display" style="color: #ffd54f;">None</strong></div>
                 <div>Foot: <span id="foot-display" style="color: #00bfa5;">-</span></div>
+                <div>
+                    <button class="button-secondary" onclick="shiftSpan(-1)">◄ Shift Span</button>
+                    <button class="button-secondary" onclick="shiftSpan(1)">Shift Span ►</button>
+                </div>
+                <div>
+                    <select id="pos-filter" onchange="updateSelectionAnalysis()">
+                        <option value="">Any Part of Speech</option>
+                        <option value="NN">Nouns (NN)</option>
+                        <option value="VB">Verbs (VB)</option>
+                        <option value="JJ">Adjectives (JJ)</option>
+                        <option value="RB">Adverbs (RB)</option>
+                    </select>
+                </div>
                 <div>Rhyme Tail: <span id="tail-idx-display">0</span></div>
-                <button onclick="cycleTail(1)">Next Rhyme Tail ➔</button>
+                <button onclick="cycleTail(1)">Next Levenshtein Rhyme ➔</button>
             </div>
 
-            <h3 style="margin-top: 15px;">Word Recommendations (Clicking spans multi-syllable foot)</h3>
+            <h3 style="margin-top: 15px;">Vocabulary Recommendations</h3>
             <div id="word-list-container">
                 <p style="color: #666;">Select syllables above to load vocabulary options matching the prosodic structure.</p>
             </div>
         </div>
 
-        <!-- 4. ELEMENT 4: DECOUPLED MULTI-LINE STANZA BUILDER -->
+        <!-- 4. MULTI-LINE STANZA BUILDER CANVAS -->
         <div class="card full-width">
             <div style="display: flex; justify-content: space-between; align-items: center;">
-                <h2>4. Multi-Line Composition Canvas</h2>
+                <h2>4. Multi-Line Stanza Canvas</h2>
                 <button onclick="addNewLine()">+ Add New Line</button>
             </div>
-            <p style="font-size: 12px; color: #aaa;">Target a line. Inserted words will auto-calculate their syllable spans, highlight matrix header positions, and auto-prioritize column rhymes.</p>
+            <p style="font-size: 12px; color: #aaa;">Target a line. Words inserted will automatically populate line positions, match grammatical meters, and auto-prioritize column rhymes.</p>
             
             <div id="stanza-container" class="stanza-container"></div>
         </div>
@@ -358,8 +435,6 @@ HTML_TEMPLATE = """
         let currentTailIndex = 0;
         let selectedPolygonPattern = "";
 
-        // Multi-line Stanza Builder State (Array of Word Token Objects per line)
-        // Token format: { word: "probably", stress: "100", syllables: 3 }
         let stanzaLines = [[]];
         let activeLineIndex = 0;
 
@@ -373,7 +448,7 @@ HTML_TEMPLATE = """
             data.polygons.forEach(p => {
                 const el = document.createElement('div');
                 el.className = 'poly-item';
-                el.innerHTML = `<strong>[${p.pattern_str}]</strong> <span style="font-size: 11px; color: #888;">${p.type}</span>`;
+                el.innerHTML = `<span><strong>[${p.pattern_str}]</strong> ${p.label}</span> <span style="font-size: 11px; color: ${p.is_balanced ? '#00e676' : '#ff5252'};">${p.type}</span>`;
                 el.onclick = () => { selectedPolygonPattern = p.pattern_str; alert('Selected pattern: ' + p.pattern_str); };
                 list.appendChild(el);
             });
@@ -395,12 +470,22 @@ HTML_TEMPLATE = """
             
             currentVersePattern.split('').forEach((bit, idx) => {
                 const box = document.createElement('div');
-                box.className = `syllables-box ${bit === '1' ? 'stressed' : 'unstressed'} ${selectedIndices.includes(idx) ? 'selected' : ''}`;
-                box.innerHTML = `<div>${bit}</div><div class="syllables-idx">${idx + 1}</div>`;
+                box.className = `syllables-box stress-${bit} ${selectedIndices.includes(idx) ? 'selected' : ''}`;
+                box.innerHTML = `<div>${bit === '1' ? '⚡' : (bit === '2' ? '⯁' : '•')} (${bit})</div><div class="syllables-idx">${idx + 1}</div>`;
                 box.onclick = () => toggleSelectBit(idx);
+                box.ondblclick = () => toggleStressLevel(idx);
                 container.appendChild(box);
             });
             updateSelectionAnalysis();
+        }
+
+        function toggleStressLevel(idx) {
+            let patArr = currentVersePattern.split('');
+            let current = patArr[idx];
+            let next = current === '0' ? '1' : (current === '1' ? '2' : '0');
+            patArr[idx] = next;
+            currentVersePattern = patArr.join('');
+            renderMatrix();
         }
 
         function toggleSelectBit(idx) {
@@ -411,6 +496,12 @@ HTML_TEMPLATE = """
             }
             selectedIndices.sort((a, b) => a - b);
             currentTailIndex = 0;
+            renderMatrix();
+        }
+
+        function shiftSpan(delta) {
+            if (selectedIndices.length === 0) return;
+            selectedIndices = selectedIndices.map(i => Math.max(0, Math.min(currentVersePattern.length - 1, i + delta)));
             renderMatrix();
         }
 
@@ -441,11 +532,12 @@ HTML_TEMPLATE = """
             const patternStr = selectedIndices.map(i => currentVersePattern[i]).join('');
             document.getElementById('selected-pattern-display').innerText = patternStr;
 
-            // Extract existing stanza words to auto-prioritize column rhymes
             const contextWords = [];
             stanzaLines.forEach(line => {
                 line.forEach(t => { if(t.word) contextWords.push(t.word); });
             });
+
+            const posFilter = document.getElementById('pos-filter').value;
 
             const res = await fetch('/api/lookup_words', {
                 method: 'POST',
@@ -453,7 +545,8 @@ HTML_TEMPLATE = """
                 body: JSON.stringify({ 
                     stress_pattern: patternStr, 
                     context_words: contextWords,
-                    tail_index: currentTailIndex 
+                    tail_index: currentTailIndex,
+                    pos_filter: posFilter
                 })
             });
             const data = await res.json();
@@ -488,7 +581,6 @@ HTML_TEMPLATE = """
             autoSelectNextSpan();
         }
 
-        /* Stanza Canvas Builder UI */
         function renderStanzaBuilder() {
             const container = document.getElementById('stanza-container');
             container.innerHTML = '';
