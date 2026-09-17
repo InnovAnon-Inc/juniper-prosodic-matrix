@@ -1,38 +1,22 @@
 #!/usr/bin/env python3
 import cmath
 import math
-import os
 import re
-from collections import defaultdict, Counter
+from collections import defaultdict
 import nltk
-from nltk.corpus import cmudict, wordnet
+from nltk.corpus import cmudict
 import pronouncing
 from flask import Flask, jsonify, render_template_string, request
 
-# Ensure NLTK datasets are present
-nltk.download("wordnet", quiet=True)
-nltk.download("words", quiet=True)
+# Download necessary corpora
 nltk.download("averaged_perceptron_tagger", quiet=True)
 nltk.download("cmudict", quiet=True)
 
 app = Flask(__name__)
 
 # ==============================================================================
-# 1. METRICAL FEET DICTIONARY & STRESS MAPPER
+# 1. METRICAL & LEVENSHTEIN DISTANCE VECTOR ENGINES
 # ==============================================================================
-METRICAL_FEET = {
-    "01": "Iamb", "10": "Trochee", "11": "Spondee", "00": "Pyrrhic",
-    "100": "Dactyl", "001": "Anapest", "010": "Amphibrach", "101": "Amphimacer",
-    "110": "Antibacchius", "011": "Bacchius", "111": "Molossus", "000": "Tribrach",
-    "1000": "Primus Paeon", "0100": "Secundus Paeon", "0010": "Tertius Paeon",
-    "0001": "Quartus Paeon", "1100": "Major Ionic", "0011": "Minor Ionic",
-    "1001": "Choriamb", "0110": "Antispast", "1010": "Ditrochee", "0101": "Diiamb"
-}
-
-def identify_metrical_foot(stress_pattern):
-    normalized = "".join(["1" if c in ("1", "2") else "0" for c in stress_pattern])
-    return METRICAL_FEET.get(normalized, "Custom Foot")
-
 def edit_distance(s1, s2):
     if len(s1) < len(s2):
         return edit_distance(s2, s1)
@@ -49,164 +33,112 @@ def edit_distance(s1, s2):
         previous_row = current_row
     return previous_row[-1]
 
+def stress_vector_similarity(target_stress, candidate_stress):
+    """Calculates normalized match score between target meter and candidate meter."""
+    if not target_stress or not candidate_stress:
+        return 0.0
+    # Pad or truncate to evaluate match
+    min_len = min(len(target_stress), len(candidate_stress))
+    max_len = max(len(target_stress), len(candidate_stress))
+    
+    matches = sum(1 for i in range(min_len) if target_stress[i] == candidate_stress[i])
+    # Penalize length discrepancies
+    return matches / max_len
 
 # ==============================================================================
-# 2. PHONETIC, POS & LEVENSHTEIN RHYME ENGINE
+# 2. LINE-LEVEL CADENCE & PHONETICS ENGINE
 # ==============================================================================
-class UnifiedPhonicsEngine:
-    def __init__(self, max_word_length=20):
-        self.max_word_length = max_word_length
-        self.vowel_phonemes = {
-            "AA", "AE", "AH", "AO", "AW", "AY", "EH", "ER", 
-            "EY", "IH", "IY", "OW", "OY", "UH", "UW"
-        }
-        self.word_profiles = {}
-        # Matrix structured by raw stress strings (preserving '1', '2', '0')
-        self.rhyme_matrix = defaultdict(lambda: defaultdict(list))
-        self.cmu = cmudict.dict() if cmudict else {}
-        self._build_indices()
+class LineCadenceEngine:
+    def __init__(self):
+        self.vowels = {"AA", "AE", "AH", "AO", "AW", "AY", "EH", "ER", "EY", "IH", "IY", "OW", "OY", "UH", "UW"}
+        self.word_db = {}
+        self._build_db()
 
-    def _clean_word(self, word):
-        return re.sub(r"[^a-z]", "", word.lower())
+    def _clean(self, text):
+        return re.sub(r"[^a-z]", "", text.lower())
 
-    def _extract_phonetic_parts(self, phones_str):
-        tokens = phones_str.split()
-        stresses = "".join([char for token in tokens for char in token if char.isdigit()])
-
+    def _extract_profile(self, word):
+        phones = pronouncing.phones_for_word(word)
+        if not phones:
+            return None
+        tokens = phones[0].split()
+        stresses = "".join([c for t in tokens for c in t if c.isdigit()])
+        
+        # Find rhyme tail (from last primary/secondary stress to end)
         stressed_idx = -1
         for i, t in enumerate(tokens):
-            clean_p = "".join([c for c in t if not c.isdigit()])
-            if clean_p in self.vowel_phonemes:
-                if "1" in t or "2" in t or stressed_idx == -1:
-                    stressed_idx = i
-                    if "1" in t:
-                        break
-
+            if any(c in t for c in ("1", "2")):
+                stressed_idx = i
+        
         if stressed_idx == -1:
-            return None
-
-        rhyme_tokens = ["".join([c for c in t if not c.isdigit()]) for t in tokens[stressed_idx:]]
-        rhyme_tail = "_".join(rhyme_tokens)
+            rhyme_tail = tokens[-1] if tokens else ""
+        else:
+            rhyme_tail = "_".join(["".join([c for c in t if not c.isdigit()]) for t in tokens[stressed_idx:]])
 
         return {
+            "word": word,
             "stress": stresses,
             "syllables": len(stresses),
-            "rhyme_tail": rhyme_tail,
+            "rhyme_tail": rhyme_tail
         }
 
-    def _build_indices(self):
-        all_words = pronouncing.search(".*")
-        for word in all_words:
-            clean = self._clean_word(word)
-            if not clean or len(clean) > self.max_word_length or clean in self.word_profiles:
-                continue
+    def _build_db(self):
+        words = pronouncing.search(".*")
+        for w in words:
+            clean_w = self._clean(w)
+            if clean_w and clean_w not in self.word_db:
+                prof = self._extract_profile(clean_w)
+                if prof:
+                    self.word_db[clean_w] = prof
 
-            phones_list = pronouncing.phones_for_word(clean)
-            if not phones_list:
-                continue
+    def generate_line_candidates(self, target_stress, context_tail=None, pos_sequence=None, limit=10):
+        """Assembles whole-line candidates matching target stress & phonetic tails."""
+        target_len = len(target_stress)
+        if target_len == 0:
+            return []
 
-            parts = self._extract_phonetic_parts(phones_list[0])
-            if not parts:
-                continue
-
-            self.word_profiles[clean] = parts
-            self.rhyme_matrix[parts["stress"]][parts["rhyme_tail"]].append(clean)
-
-    def analyze_phrase(self, text):
-        words = re.findall(r"\b[a-zA-Z]+\b", text.lower())
-        results = []
-        full_stress = ""
+        # Find words that fit chunks of the target stress
+        matching_lines = []
         
-        # POS Tagging
-        tokens_tagged = nltk.pos_tag(words)
-
-        for w, pos in tokens_tagged:
-            prof = self.word_profiles.get(w)
-            if not prof:
-                phones = pronouncing.phones_for_word(w)
-                if phones:
-                    prof = self._extract_phonetic_parts(phones[0])
-
-            if prof:
-                results.append({
-                    "word": w,
-                    "stress": prof["stress"],
-                    "syllables": prof["syllables"],
-                    "rhyme_tail": prof["rhyme_tail"],
-                    "pos": pos,
-                    "foot": identify_metrical_foot(prof["stress"]),
+        # Simple recursive dynamic programming match for line assembly
+        def build_phrase(rem_stress, current_phrase, current_tail):
+            if len(matching_lines) >= limit * 3:
+                return
+            if not rem_stress:
+                # Calculate whole-line tail distance if context tail exists
+                distance = edit_distance(current_tail, context_tail) if context_tail else 0
+                matching_lines.append({
+                    "line": " ".join([w["word"] for w in current_phrase]),
+                    "stress": "".join([w["stress"] for w in current_phrase]),
+                    "rhyme_tail": current_tail,
+                    "levenshtein_dist": distance
                 })
-                full_stress += prof["stress"]
-            else:
-                results.append({
-                    "word": w,
-                    "stress": "1",
-                    "syllables": 1,
-                    "rhyme_tail": "unknown",
-                    "pos": pos,
-                    "foot": "Unknown",
-                })
-                full_stress += "1"
+                return
 
-        return {"tokens": results, "full_stress_pattern": full_stress}
+            # Match chunk lengths (1 to 4 syllables)
+            for chunk_len in range(1, min(5, len(rem_stress) + 1)):
+                sub_stress = rem_stress[:chunk_len]
+                # Filter candidates from db matching sub_stress
+                candidates = [prof for prof in self.word_db.values() if prof["stress"] == sub_stress]
+                for cand in candidates[:3]: # Sample top matches for efficiency
+                    build_phrase(
+                        rem_stress[chunk_len:], 
+                        current_phrase + [cand], 
+                        cand["rhyme_tail"]
+                    )
 
-    def get_words_for_selection(self, stress_pattern, line_context_words=None, tail_index=0, target_pos=None):
-        # Match pattern flexibly across 1s, 2s, and 0s
-        matching_keys = [k for k in self.rhyme_matrix.keys() if len(k) == len(stress_pattern) and 
-                         all(p == '0' and k_i == '0' or p != '0' and k_i != '0' for p, k_i in zip(stress_pattern, k))]
-        
-        if not matching_keys:
-            return {"tails": [], "current_tail": None, "words": []}
+        build_phrase(target_stress, [], "")
 
-        all_tails = set()
-        for k in matching_keys:
-            all_tails.update(self.rhyme_matrix[k].keys())
+        # Sort by Levenshtein distance on rhyme tail if context exists
+        if context_tail:
+            matching_lines.sort(key=lambda x: x["levenshtein_dist"])
 
-        if not all_tails:
-            return {"tails": [], "current_tail": None, "words": []}
+        return matching_lines[:limit]
 
-        # Priority 1: Extract rhyme tails from existing line/stanza words
-        context_tails = []
-        if line_context_words:
-            for pw in line_context_words:
-                clean_pw = self._clean_word(pw)
-                prof = self.word_profiles.get(clean_pw)
-                if prof and prof["rhyme_tail"] in all_tails:
-                    context_tails.append(prof["rhyme_tail"])
-
-        target_tail = context_tails[0] if context_tails else list(all_tails)[0]
-
-        # Levenshtein distance ordering on Rhyme Tails
-        sorted_tails = sorted(list(all_tails), key=lambda t: edit_distance(t, target_tail))
-
-        selected_tail = sorted_tails[tail_index % len(sorted_tails)]
-
-        word_list = []
-        for k in matching_keys:
-            word_list.extend(self.rhyme_matrix[k][selected_tail])
-            
-        word_list = sorted(list(set(word_list)))
-
-        # Part of Speech filtering if requested
-        if target_pos:
-            pos_words = [w for w, tag in nltk.pos_tag(word_list) if tag.startswith(target_pos)]
-            if pos_words:
-                word_list = pos_words
-
-        return {
-            "tails_count": len(sorted_tails),
-            "current_tail_index": tail_index % len(sorted_tails),
-            "current_tail": selected_tail,
-            "metrical_foot": identify_metrical_foot(stress_pattern),
-            "words": word_list,
-            "is_prioritized": len(context_tails) > 0 and selected_tail in context_tails
-        }
-
-
-phonics_engine = UnifiedPhonicsEngine()
+line_engine = LineCadenceEngine()
 
 # ==============================================================================
-# 3. PROPERLY BALANCED POLYGON & RHYTHM ENGINE (ZERO-CENTROID ORIGIN)
+# 3. BALANCED POLYGON ENGINE
 # ==============================================================================
 def bjorklund(steps: int, pulses: int) -> list[int]:
     if pulses <= 0: return [0] * steps
@@ -220,85 +152,38 @@ def bjorklund(steps: int, pulses: int) -> list[int]:
     pattern.extend(remainder)
     return [bit for group in pattern for bit in group]
 
-def get_centroid(pattern: list[int], N: int) -> tuple[float, float]:
-    if not pattern or sum(pattern) == 0: return 0.0, 0.0
-    total_vector = 0j
-    for i, active in enumerate(pattern):
-        if active:
-            angle = 2 * math.pi * i / N
-            total_vector += cmath.exp(1j * angle)
-    center = total_vector / sum(pattern)
-    return center.real, center.imag
-
-def is_strictly_balanced(pattern: list[int], N: int, tol: float = 1e-5) -> bool:
-    cx, cy = get_centroid(pattern, N)
-    return math.hypot(cx, cy) < tol
-
 def analyze_polygon(pattern: list[int], N: int) -> dict:
-    cx, cy = get_centroid(pattern, N)
-    balanced = is_strictly_balanced(pattern, N)
+    total_vector = sum(cmath.exp(1j * 2 * math.pi * i / N) for i, active in enumerate(pattern) if active)
+    cx, cy = (total_vector / sum(pattern)).real, (total_vector / sum(pattern)).imag if sum(pattern) > 0 else (0,0)
+    balanced = math.hypot(cx, cy) < 1e-5
     return {
         "pattern_str": "".join(map(str, pattern)),
         "is_balanced": balanced,
-        "centroid": [round(cx, 5), round(cy, 5)],
-        "dist_from_origin": round(math.hypot(cx, cy), 5),
-        "type": "Balanced (Cyclotomic)" if balanced else "Unbalanced (Euclidean)"
+        "label": f"{'Cyclotomic Balanced' if balanced else 'Euclidean'} ({sum(pattern)}/{N})"
     }
 
-def get_canonical_rotation(pattern: list[int]) -> tuple[int, ...]:
-    n = len(pattern)
-    rotations = [tuple(pattern[i:] + pattern[:i]) for i in range(n)]
-    return min(rotations)
-
-def get_interesting_polygons(N: int) -> list[dict]:
-    results, seen = [], set()
-    for k in range(1, N):
-        euc_pat = bjorklund(N, k)
-        canonical = get_canonical_rotation(euc_pat)
-        if canonical not in seen:
-            seen.add(canonical)
-            analysis = analyze_polygon(list(canonical), N)
-            analysis["label"] = f"Euclidean E({k},{N})"
-            results.append(analysis)
-
-    total_combos = 1 << N
-    for i in range(1, total_combos - 1):
-        pat = [(i >> j) & 1 for j in range(N)]
-        if is_strictly_balanced(pat, N):
-            canonical = get_canonical_rotation(pat)
-            if canonical not in seen:
-                seen.add(canonical)
-                analysis = analyze_polygon(list(canonical), N)
-                analysis["label"] = f"Cyclotomic Balanced ({sum(canonical)} pulses)"
-                results.append(analysis)
-    return results
-
 # ==============================================================================
-# 4. FLASK ROUTES
+# 4. API & FLASK ROUTES
 # ==============================================================================
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route("/api/polygons", methods=["GET"])
-def api_polygons():
-    n = int(request.args.get("n", 8))
-    return jsonify({"n": n, "polygons": get_interesting_polygons(n)})
-
-@app.route("/api/analyze_phrase", methods=["POST"])
-def api_analyze_phrase():
+@app.route("/api/full_line_stepper", methods=["POST"])
+def api_full_line_stepper():
     data = request.get_json() or {}
-    return jsonify(phonics_engine.analyze_phrase(data.get("phrase", "")))
-
-@app.route("/api/lookup_words", methods=["POST"])
-def api_lookup_words():
-    data = request.get_json() or {}
-    return jsonify(phonics_engine.get_words_for_selection(
-        stress_pattern=data.get("stress_pattern", ""),
-        line_context_words=data.get("context_words", []),
-        tail_index=int(data.get("tail_index", 0)),
-        target_pos=data.get("pos_filter")
-    ))
+    target_stress = data.get("target_stress", "")
+    context_tail = data.get("context_tail", "")
+    
+    candidates = line_engine.generate_line_candidates(
+        target_stress=target_stress,
+        context_tail=context_tail,
+        limit=12
+    )
+    return jsonify({
+        "target_stress": target_stress,
+        "lines": candidates
+    })
 
 # ==============================================================================
 # 5. UI TEMPLATE
@@ -308,378 +193,145 @@ HTML_TEMPLATE = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Prosodic Matrix & Stanza Builder</title>
+    <title>Full-Line Prosodic Stepper & Cadence Engine</title>
     <style>
         body { font-family: 'Segoe UI', monospace, sans-serif; background: #121214; color: #e0e0e0; margin: 0; padding: 20px; }
         h1, h2, h3 { color: #4db6ac; margin-top: 0; }
         .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
         .card { background: #1e1e24; border-radius: 8px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.4); }
         .full-width { grid-column: span 2; }
-        input, button, textarea, select { background: #2a2a32; border: 1px solid #444; color: #fff; padding: 8px 12px; border-radius: 4px; }
+        input, button, select { background: #2a2a32; border: 1px solid #444; color: #fff; padding: 8px 12px; border-radius: 4px; }
         button { background: #00897b; font-weight: bold; cursor: pointer; }
         button:hover { background: #00bfa5; }
         .button-secondary { background: #37474f; }
         .button-secondary:hover { background: #455a64; }
-        .button-danger { background: #c62828; }
-        .button-danger:hover { background: #e53935; }
 
-        .matrix-bar-container { display: flex; gap: 4px; margin: 15px 0; overflow-x: auto; padding: 10px; background: #18181c; border-radius: 6px; }
-        .syllables-box { 
-            flex: 1; min-width: 42px; height: 55px; display: flex; flex-direction: column; align-items: center; 
-            justify-content: center; background: #2a2a32; border: 1px solid #444; border-radius: 4px; 
-            cursor: pointer; user-select: none; transition: all 0.2s;
+        .line-candidate-box { 
+            background: #18181c; border: 1px solid #333; padding: 12px; margin-bottom: 8px; 
+            border-radius: 6px; display: flex; justify-content: space-between; align-items: center; 
+            cursor: pointer; transition: border-color 0.2s;
         }
-        .syllables-box.selected { border-color: #ffd54f; background: #3d3b2a; }
-        .syllables-box.stress-1 { color: #00e676; font-weight: bold; }
-        .syllables-box.stress-2 { color: #ffb74d; font-weight: bold; }
-        .syllables-box.stress-0 { color: #666; }
-        .syllables-idx { font-size: 10px; color: #888; margin-top: 2px; }
-
-        .stanza-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; }
-        .line-row { display: flex; align-items: center; gap: 10px; background: #18181c; padding: 10px; border-radius: 6px; border: 1px solid #333; }
-        .line-row.active-line { border-color: #00bfa5; background: #1f2826; }
-        .line-number { font-weight: bold; color: #4db6ac; width: 60px; font-size: 13px; }
-        
-        .line-tokens-container { flex-grow: 1; display: flex; flex-wrap: wrap; gap: 6px; min-height: 36px; align-items: center; background: #121214; padding: 6px; border-radius: 4px; }
-        .token-chip { display: flex; align-items: center; gap: 6px; background: #2a2a35; border: 1px solid #444; padding: 4px 8px; border-radius: 4px; font-family: monospace; }
-        .token-chip .stress-tag { font-size: 10px; color: #00e676; background: #18281e; padding: 1px 4px; border-radius: 2px; }
-        .token-chip .remove-btn { cursor: pointer; color: #ff5252; font-weight: bold; margin-left: 4px; }
-
-        .word-chip { display: inline-block; background: #33333d; border-left: 3px solid #00bfa5; padding: 6px 10px; margin: 3px; border-radius: 3px; font-size: 13px; cursor: pointer; }
-        .word-chip:hover { background: #004d40; color: #fff; }
-        .word-chip.prioritized { border-left-color: #ffd54f; background: #3d3b2a; }
-        .poly-item { padding: 8px; background: #2a2a32; margin-bottom: 4px; cursor: pointer; border-radius: 4px; display: flex; justify-content: space-between; }
-        .poly-item:hover { background: #383842; }
+        .line-candidate-box:hover { border-color: #00bfa5; background: #1f2826; }
+        .stress-badge { font-family: monospace; color: #00e676; background: #18281e; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+        .dist-badge { font-size: 11px; color: #ffd54f; }
+        .stepper-controls { display: flex; gap: 10px; align-items: center; background: #18181c; padding: 10px; border-radius: 6px; margin-bottom: 15px; }
     </style>
 </head>
 <body>
 
-    <h1>Prosodic Matrix & Multi-Line Stanza Builder</h1>
+    <h1>Full-Line Prosodic Stepper & Cadence Engine</h1>
 
     <div class="grid">
-        <!-- 1. DECONSTRUCT PHRASE (WORKFLOW STEP 1) -->
-        <div class="card">
-            <h2>1. Deconstruct Target Phrase</h2>
-            <textarea id="phrase-input" style="width: 100%; height: 50px;" placeholder="Type phrase to extract metrical stress..."></textarea>
-            <button onclick="analyzePhrase()" style="margin-top: 8px;">Deconstruct to Master Pattern</button>
-            <div id="phrase-tokens" style="margin-top: 8px;"></div>
-        </div>
-
-        <!-- 2. RHYTHM & POLYGON OVERLAY (WORKFLOW STEP 2) -->
-        <div class="card">
-            <h2>2. Balanced Rhythm Overlay</h2>
-            <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
-                <label>N-gon Syllables:</label>
-                <input type="number" id="n-input" value="8" min="3" max="16" style="width: 50px;">
-                <button onclick="fetchPolygons()">Find Polygons</button>
-            </div>
-            <div id="polygon-list" style="max-height: 120px; overflow-y: auto;"></div>
-            <div style="margin-top: 10px;">
-                <label>Repeat:</label>
-                <input type="number" id="repeat-input" value="2" min="1" max="4" style="width: 50px;">
-                <button onclick="applyPolygonVerse()">Overlay Master Rhythm</button>
-            </div>
-        </div>
-
-        <!-- 3. MASTER PROSODIC MATRIX HEADER -->
         <div class="card full-width">
-            <h2>3. Master Prosodic Matrix & Word Selector</h2>
-            <p style="font-size: 12px; color: #aaa;">
-                Click box to toggle stress (0=Unstressed, 1=Primary, 2=Secondary). Double-click or shift span. 
-                Use cycle buttons to walk word groupings or match parts-of-speech.
+            <h2>Line-by-Line Automated Cadence Stepper</h2>
+            <p style="font-size: 13px; color: #aaa;">
+                Step through entire lines of poetry matched directly against your master stress pattern. 
+                Auto-expands/contracts spans and ranks full lines by Levenshtein distance against preceding stanza rhymes.
             </p>
-            
-            <div id="matrix-container" class="matrix-bar-container"></div>
-            
-            <div style="display: flex; gap: 15px; align-items: center; background: #18181c; padding: 10px; border-radius: 6px; flex-wrap: wrap;">
-                <div>Pattern: <strong id="selected-pattern-display" style="color: #ffd54f;">None</strong></div>
-                <div>Foot: <span id="foot-display" style="color: #00bfa5;">-</span></div>
-                <div>
-                    <button class="button-secondary" onclick="shiftSpan(-1)">◄ Shift Span</button>
-                    <button class="button-secondary" onclick="shiftSpan(1)">Shift Span ►</button>
-                </div>
-                <div>
-                    <select id="pos-filter" onchange="updateSelectionAnalysis()">
-                        <option value="">Any Part of Speech</option>
-                        <option value="NN">Nouns (NN)</option>
-                        <option value="VB">Verbs (VB)</option>
-                        <option value="JJ">Adjectives (JJ)</option>
-                        <option value="RB">Adverbs (RB)</option>
-                    </select>
-                </div>
-                <div>Rhyme Tail: <span id="tail-idx-display">0</span></div>
-                <button onclick="cycleTail(1)">Next Levenshtein Rhyme ➔</button>
+
+            <div class="stepper-controls">
+                <label>Master Line Meter:</label>
+                <input type="text" id="target-stress" value="10010010" style="font-family: monospace; width: 140px;">
+                <label>Context Rhyme Tail:</label>
+                <input type="text" id="context-tail" placeholder="e.g., AH_NG" style="width: 100px;">
+                <button onclick="fetchLineCandidates()">Auto-Fit Full Lines ➔</button>
+                <button class="button-secondary" onclick="autoExpandSpan(-1)">Contract Span -1</button>
+                <button class="button-secondary" onclick="autoExpandSpan(1)">Expand Span +1</button>
             </div>
 
-            <h3 style="margin-top: 15px;">Vocabulary Recommendations</h3>
-            <div id="word-list-container">
-                <p style="color: #666;">Select syllables above to load vocabulary options matching the prosodic structure.</p>
+            <h3>Matching Full-Line Offerings</h3>
+            <div id="full-line-results">
+                <p style="color: #666;">Click "Auto-Fit Full Lines" to synthesize full-line candidates matching target meter and rhyme.</p>
             </div>
         </div>
 
-        <!-- 4. MULTI-LINE STANZA BUILDER CANVAS -->
         <div class="card full-width">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <h2>4. Multi-Line Stanza Canvas</h2>
-                <button onclick="addNewLine()">+ Add New Line</button>
-            </div>
-            <p style="font-size: 12px; color: #aaa;">Target a line. Words inserted will automatically populate line positions, match grammatical meters, and auto-prioritize column rhymes.</p>
-            
-            <div id="stanza-container" class="stanza-container"></div>
+            <h2>Stanza Canvas</h2>
+            <div id="stanza-lines-list" style="display: flex; flex-direction: column; gap: 8px;"></div>
         </div>
     </div>
 
     <script>
-        let currentVersePattern = "1001001010010010";
-        let selectedIndices = [];
-        let currentTailIndex = 0;
-        let selectedPolygonPattern = "";
+        let currentStanza = [];
 
-        let stanzaLines = [[]];
-        let activeLineIndex = 0;
+        async function fetchLineCandidates() {
+            const stress = document.getElementById('target-stress').value;
+            const tail = document.getElementById('context-tail').value;
 
-        async function fetchPolygons() {
-            const n = document.getElementById('n-input').value;
-            const res = await fetch(`/api/polygons?n=${n}`);
+            const res = await fetch('/api/full_line_stepper', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ target_stress: stress, context_tail: tail })
+            });
+
             const data = await res.json();
-            const list = document.getElementById('polygon-list');
-            list.innerHTML = '';
-            
-            data.polygons.forEach(p => {
+            const container = document.getElementById('full-line-results');
+            container.innerHTML = '';
+
+            if(!data.lines || data.lines.length === 0) {
+                container.innerHTML = '<p style="color: #888;">No exact whole-line combinations found for this exact vector. Try expanding or contracting meter span.</p>';
+                return;
+            }
+
+            data.lines.forEach(item => {
                 const el = document.createElement('div');
-                el.className = 'poly-item';
-                el.innerHTML = `<span><strong>[${p.pattern_str}]</strong> ${p.label}</span> <span style="font-size: 11px; color: ${p.is_balanced ? '#00e676' : '#ff5252'};">${p.type}</span>`;
-                el.onclick = () => { selectedPolygonPattern = p.pattern_str; alert('Selected pattern: ' + p.pattern_str); };
-                list.appendChild(el);
-            });
-            if(data.polygons.length > 0) selectedPolygonPattern = data.polygons[0].pattern_str;
-        }
-
-        function applyPolygonVerse() {
-            if(!selectedPolygonPattern) return;
-            const reps = parseInt(document.getElementById('repeat-input').value);
-            currentVersePattern = selectedPolygonPattern.repeat(reps);
-            selectedIndices = [];
-            renderMatrix();
-            autoSelectNextSpan();
-        }
-
-        function renderMatrix() {
-            const container = document.getElementById('matrix-container');
-            container.innerHTML = '';
-            
-            currentVersePattern.split('').forEach((bit, idx) => {
-                const box = document.createElement('div');
-                box.className = `syllables-box stress-${bit} ${selectedIndices.includes(idx) ? 'selected' : ''}`;
-                box.innerHTML = `<div>${bit === '1' ? '⚡' : (bit === '2' ? '⯁' : '•')} (${bit})</div><div class="syllables-idx">${idx + 1}</div>`;
-                box.onclick = () => toggleSelectBit(idx);
-                box.ondblclick = () => toggleStressLevel(idx);
-                container.appendChild(box);
-            });
-            updateSelectionAnalysis();
-        }
-
-        function toggleStressLevel(idx) {
-            let patArr = currentVersePattern.split('');
-            let current = patArr[idx];
-            let next = current === '0' ? '1' : (current === '1' ? '2' : '0');
-            patArr[idx] = next;
-            currentVersePattern = patArr.join('');
-            renderMatrix();
-        }
-
-        function toggleSelectBit(idx) {
-            if (selectedIndices.includes(idx)) {
-                selectedIndices = selectedIndices.filter(i => i !== idx);
-            } else {
-                selectedIndices.push(idx);
-            }
-            selectedIndices.sort((a, b) => a - b);
-            currentTailIndex = 0;
-            renderMatrix();
-        }
-
-        function shiftSpan(delta) {
-            if (selectedIndices.length === 0) return;
-            selectedIndices = selectedIndices.map(i => Math.max(0, Math.min(currentVersePattern.length - 1, i + delta)));
-            renderMatrix();
-        }
-
-        function getActiveLineSyllableCount() {
-            const tokens = stanzaLines[activeLineIndex] || [];
-            return tokens.reduce((sum, t) => sum + (t.syllables || 1), 0);
-        }
-
-        function autoSelectNextSpan(length = 1) {
-            const currentSyls = getActiveLineSyllableCount();
-            selectedIndices = [];
-            for (let i = 0; i < length; i++) {
-                if (currentSyls + i < currentVersePattern.length) {
-                    selectedIndices.push(currentSyls + i);
-                }
-            }
-            renderMatrix();
-        }
-
-        async function updateSelectionAnalysis() {
-            if(selectedIndices.length === 0) {
-                document.getElementById('selected-pattern-display').innerText = "None";
-                document.getElementById('foot-display').innerText = "-";
-                document.getElementById('word-list-container').innerHTML = '<p style="color: #666;">Select syllables above.</p>';
-                return;
-            }
-
-            const patternStr = selectedIndices.map(i => currentVersePattern[i]).join('');
-            document.getElementById('selected-pattern-display').innerText = patternStr;
-
-            const contextWords = [];
-            stanzaLines.forEach(line => {
-                line.forEach(t => { if(t.word) contextWords.push(t.word); });
-            });
-
-            const posFilter = document.getElementById('pos-filter').value;
-
-            const res = await fetch('/api/lookup_words', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ 
-                    stress_pattern: patternStr, 
-                    context_words: contextWords,
-                    tail_index: currentTailIndex,
-                    pos_filter: posFilter
-                })
-            });
-            const data = await res.json();
-            
-            document.getElementById('foot-display').innerText = data.metrical_foot || "Custom";
-            document.getElementById('tail-idx-display').innerText = `${data.current_tail_index + 1} / ${data.tails_count || 0} (${data.current_tail || 'None'})`;
-
-            const container = document.getElementById('word-list-container');
-            if(!data.words || data.words.length === 0) {
-                container.innerHTML = '<p style="color: #888;">No exact matches for this foot. Cycle tails or shift selection.</p>';
-                return;
-            }
-
-            container.innerHTML = '';
-            data.words.forEach(w => {
-                const chip = document.createElement('div');
-                chip.className = `word-chip ${data.is_prioritized ? 'prioritized' : ''}`;
-                chip.innerText = w;
-                chip.onclick = () => insertWordToStanza(w, patternStr);
-                container.appendChild(chip);
-            });
-        }
-
-        async function insertWordToStanza(word, stress) {
-            const syls = stress.length;
-            const token = { word: word, stress: stress, syllables: syls };
-
-            if (!stanzaLines[activeLineIndex]) stanzaLines[activeLineIndex] = [];
-            stanzaLines[activeLineIndex].push(token);
-
-            renderStanzaBuilder();
-            autoSelectNextSpan();
-        }
-
-        function renderStanzaBuilder() {
-            const container = document.getElementById('stanza-container');
-            container.innerHTML = '';
-
-            stanzaLines.forEach((lineTokens, idx) => {
-                const row = document.createElement('div');
-                row.className = `line-row ${idx === activeLineIndex ? 'active-line' : ''}`;
-
-                let tokensHTML = '';
-                lineTokens.forEach((t, tIdx) => {
-                    tokensHTML += `
-                        <div class="token-chip">
-                            <span>${t.word}</span>
-                            <span class="stress-tag">${t.stress}</span>
-                            <span class="remove-btn" onclick="removeToken(${idx}, ${tIdx})">✕</span>
+                el.className = 'line-candidate-box';
+                el.innerHTML = `
+                    <div>
+                        <strong style="font-size: 16px; color: #fff;">${item.line}</strong>
+                        <div style="margin-top: 4px;">
+                            <span class="stress-badge">Meter: ${item.stress}</span>
+                            <span class="dist-badge">Tail: ${item.rhyme_tail} (Dist: ${item.levenshtein_dist})</span>
                         </div>
-                    `;
-                });
-
-                row.innerHTML = `
-                    <div class="line-number">Line ${idx + 1}</div>
-                    <div class="line-tokens-container" onclick="setActiveLine(${idx})">
-                        ${tokensHTML || '<span style="color:#555; font-size:12px;">Click target button to fill this line...</span>'}
                     </div>
-                    <div style="display:flex; gap:6px;">
-                        <button class="${idx === activeLineIndex ? '' : 'button-secondary'}" onclick="setActiveLine(${idx})">
-                            ${idx === activeLineIndex ? 'Targeted' : 'Target'}
-                        </button>
-                        <button class="button-danger" onclick="deleteLine(${idx})">✕</button>
-                    </div>
+                    <button onclick="acceptLine('${item.line.replace(/'/g, "\\'")}', '${item.stress}', '${item.rhyme_tail}')">Accept Line ➔</button>
                 `;
-                container.appendChild(row);
+                container.appendChild(el);
             });
         }
 
-        function removeToken(lineIdx, tokenIdx) {
-            stanzaLines[lineIdx].splice(tokenIdx, 1);
-            renderStanzaBuilder();
-            autoSelectNextSpan();
+        function acceptLine(line, stress, tail) {
+            currentStanza.push({ line: line, stress: stress, tail: tail });
+            document.getElementById('context-tail').value = tail; // Auto-chain rhyme tail to next line
+            renderStanza();
+            fetchLineCandidates(); // Refresh next set of options linked to new tail
         }
 
-        function setActiveLine(idx) {
-            activeLineIndex = idx;
-            renderStanzaBuilder();
-            autoSelectNextSpan();
-        }
-
-        function addNewLine() {
-            stanzaLines.push([]);
-            activeLineIndex = stanzaLines.length - 1;
-            renderStanzaBuilder();
-            autoSelectNextSpan();
-        }
-
-        function deleteLine(idx) {
-            stanzaLines.splice(idx, 1);
-            if (stanzaLines.length === 0) stanzaLines = [[]];
-            activeLineIndex = Math.max(0, stanzaLines.length - 1);
-            renderStanzaBuilder();
-            autoSelectNextSpan();
-        }
-
-        function cycleTail(step) {
-            currentTailIndex += step;
-            updateSelectionAnalysis();
-        }
-
-        async function analyzePhrase() {
-            const phrase = document.getElementById('phrase-input').value;
-            const res = await fetch('/api/analyze_phrase', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ phrase: phrase })
+        function renderStanza() {
+            const container = document.getElementById('stanza-lines-list');
+            container.innerHTML = '';
+            currentStanza.forEach((item, idx) => {
+                const el = document.createElement('div');
+                el.style.cssText = 'background: #18181c; padding: 10px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center;';
+                el.innerHTML = `
+                    <div>
+                        <span style="color: #00bfa5; font-weight: bold; margin-right: 10px;">Line ${idx + 1}:</span>
+                        <span style="font-size: 15px;">${item.line}</span>
+                    </div>
+                    <span class="stress-badge">${item.stress}</span>
+                `;
+                container.appendChild(el);
             });
-            const data = await res.json();
-            
-            if(data.full_stress_pattern) {
-                currentVersePattern = data.full_stress_pattern;
-                stanzaLines[activeLineIndex] = data.tokens.map(t => ({
-                    word: t.word,
-                    stress: t.stress,
-                    syllables: t.syllables || t.stress.length
-                }));
-                selectedIndices = [];
-                renderMatrix();
-                renderStanzaBuilder();
-                autoSelectNextSpan();
+        }
+
+        function autoExpandSpan(delta) {
+            const input = document.getElementById('target-stress');
+            let val = input.value;
+            if(delta > 0) {
+                val += '0';
+            } else if(val.length > 1) {
+                val = val.slice(0, -1);
             }
+            input.value = val;
+            fetchLineCandidates();
         }
 
-        fetchPolygons();
-        renderMatrix();
-        renderStanzaBuilder();
-        autoSelectNextSpan();
+        fetchLineCandidates();
     </script>
 </body>
 </html>
 """
 
 if __name__ == "__main__":
-    print("Running Prosodic Matrix App on http://0.0.0.0:5009")
+    print("Running Full-Line Prosodic Stepper on http://0.0.0.0:5009")
     app.run(host="0.0.0.0", port=5009, debug=True)
